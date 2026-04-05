@@ -1,5 +1,5 @@
 subscription_url: https://example.com/api/v1/client/subscribe?token=YOUR_TOKEN&flag=clash
-preferences_file: ./preferences.example.yaml
+preferences_file: ./preferences.yaml
 output_dir: ./output
 latest_filename: latest.yaml
 history_filename_pattern: config-%Y%m%d-%H%M%S.yaml

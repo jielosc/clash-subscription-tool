@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 from __future__ import annotations
 
 import argparse
@@ -14,6 +16,7 @@ import yaml
 
 USER_AGENT = "clash-subscription-tool/1.0"
 PRIMARY_PROXY_GROUP_NAME = "PROXY"
+DEFAULT_CONFIG_PATH = "settings.yaml"
 
 
 class ToolError(Exception):
@@ -32,6 +35,7 @@ class ToolConfig:
 
 @dataclass(frozen=True)
 class Preferences:
+    proxies: list[dict[str, Any]]
     rule_providers: dict[str, dict[str, Any]]
     rules: list[str]
 
@@ -46,12 +50,15 @@ class RunResult:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Download a Clash subscription and replace rule-providers and rules."
+        description=(
+            "Download a Clash subscription, optionally merge proxies, "
+            "and replace rule-providers and rules."
+        )
     )
     parser.add_argument(
         "--config",
-        required=True,
-        help="Path to the settings YAML file.",
+        default=DEFAULT_CONFIG_PATH,
+        help=f"Path to the settings YAML file. Default: ./{DEFAULT_CONFIG_PATH}",
     )
     return parser
 
@@ -168,6 +175,27 @@ def load_preferences(preferences_path: Path) -> Preferences:
             f"Preferences file must contain a YAML mapping: {preferences_path}"
         )
 
+    proxies_value = data.get("proxies", [])
+    if not isinstance(proxies_value, list):
+        raise ToolError("Preferences proxies must be a list when provided")
+
+    normalized_proxies: list[dict[str, Any]] = []
+    seen_proxy_names: set[str] = set()
+    for index, proxy in enumerate(proxies_value, start=1):
+        if not isinstance(proxy, Mapping) or not proxy:
+            raise ToolError(f"Preferences proxy #{index} must be a non-empty mapping")
+
+        proxy_name = proxy.get("name")
+        if not isinstance(proxy_name, str) or not proxy_name.strip():
+            raise ToolError(
+                f"Preferences proxy #{index} must define a non-empty name"
+            )
+        if proxy_name in seen_proxy_names:
+            raise ToolError(f"Duplicate preferences proxy name: {proxy_name}")
+
+        seen_proxy_names.add(proxy_name)
+        normalized_proxies.append(dict(proxy))
+
     if "rule-providers" not in data:
         raise ToolError("Preferences file must define rule-providers")
     if "rules" not in data:
@@ -198,6 +226,7 @@ def load_preferences(preferences_path: Path) -> Preferences:
         normalized_rules.append(rule)
 
     return Preferences(
+        proxies=normalized_proxies,
         rule_providers=normalized_providers,
         rules=normalized_rules,
     )
@@ -249,13 +278,57 @@ def merge_preferences(
     preferences: Preferences,
 ) -> dict[str, Any]:
     merged = copy.deepcopy(subscription_config)
+    merged_proxies = merge_proxies(merged.get("proxies"), preferences.proxies)
+    if merged_proxies is not None:
+        merged["proxies"] = merged_proxies
     merged["rule-providers"] = copy.deepcopy(preferences.rule_providers)
     merged["rules"] = list(preferences.rules)
-    merged["proxy-groups"] = build_proxy_groups(merged.get("proxy-groups"))
+    merged["proxy-groups"] = build_proxy_groups(
+        merged.get("proxy-groups"),
+        extra_proxy_names=[proxy["name"] for proxy in preferences.proxies],
+    )
     return merged
 
 
-def build_proxy_groups(proxy_groups_value: Any) -> list[Any]:
+def merge_proxies(
+    subscription_proxies_value: Any,
+    preference_proxies: list[dict[str, Any]],
+) -> list[Any] | None:
+    if subscription_proxies_value is None:
+        if not preference_proxies:
+            return None
+        merged_proxies: list[Any] = []
+    elif not isinstance(subscription_proxies_value, list):
+        raise ToolError("Subscription proxies must be a list")
+    else:
+        merged_proxies = copy.deepcopy(subscription_proxies_value)
+
+    proxy_indexes_by_name: dict[str, int] = {}
+    for index, proxy in enumerate(merged_proxies):
+        if not isinstance(proxy, Mapping):
+            continue
+        proxy_name = proxy.get("name")
+        if not isinstance(proxy_name, str) or not proxy_name.strip():
+            continue
+        proxy_indexes_by_name[proxy_name] = index
+
+    for proxy in preference_proxies:
+        proxy_name = proxy["name"]
+        if proxy_name in proxy_indexes_by_name:
+            merged_proxies[proxy_indexes_by_name[proxy_name]] = copy.deepcopy(proxy)
+            continue
+
+        proxy_indexes_by_name[proxy_name] = len(merged_proxies)
+        merged_proxies.append(copy.deepcopy(proxy))
+
+    return merged_proxies
+
+
+def build_proxy_groups(
+    proxy_groups_value: Any,
+    *,
+    extra_proxy_names: list[str] | None = None,
+) -> list[Any]:
     if proxy_groups_value is None:
         remaining_groups: list[Any] = []
     elif not isinstance(proxy_groups_value, list):
@@ -280,6 +353,11 @@ def build_proxy_groups(proxy_groups_value: Any) -> list[Any]:
         if group_name in proxies:
             continue
         proxies.append(group_name)
+
+    for proxy_name in extra_proxy_names or []:
+        if proxy_name in proxies:
+            continue
+        proxies.append(proxy_name)
 
     primary_group = {
         "name": PRIMARY_PROXY_GROUP_NAME,
@@ -340,3 +418,7 @@ def require_non_empty_string(value: Any, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ToolError(f"{field_name} must be a non-empty string")
     return value.strip()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

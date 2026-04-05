@@ -5,10 +5,11 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
 
-from clash_subscription_tool import ToolError, run
+from clash_subscription_tool import RunResult, ToolError, build_parser, main, run
 
 
 class FakeResponse:
@@ -40,9 +41,34 @@ class FakeSession:
 
 
 class ClashSubscriptionToolTests(unittest.TestCase):
+    def test_parser_defaults_to_local_settings_yaml(self) -> None:
+        args = build_parser().parse_args([])
+        self.assertEqual(args.config, "settings.yaml")
+
+    def test_main_uses_default_settings_file_without_args(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            original_cwd = Path.cwd()
+            temp_path = Path(temp_dir).resolve()
+            expected_result = RunResult(
+                history_path=temp_path / "out" / "config.yaml",
+                latest_path=temp_path / "out" / "latest.yaml",
+                provider_count=1,
+                rule_count=2,
+            )
+
+            os.chdir(temp_path)
+            try:
+                with patch("clash_subscription_tool.run", return_value=expected_result) as run_mock:
+                    exit_code = main([])
+            finally:
+                os.chdir(original_cwd)
+
+            self.assertEqual(exit_code, 0)
+            run_mock.assert_called_once_with(Path("settings.yaml"))
+
     def test_run_replaces_rules_rule_providers_and_prepends_proxy_group(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
+            temp_path = Path(temp_dir).resolve()
             settings_path = temp_path / "settings.yaml"
             preferences_path = temp_path / "preferences.yaml"
             output_dir = temp_path / "out"
@@ -148,7 +174,7 @@ class ClashSubscriptionToolTests(unittest.TestCase):
 
     def test_run_adds_missing_rules_sections_and_proxy_groups(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
+            temp_path = Path(temp_dir).resolve()
             settings_path = temp_path / "settings.yaml"
             preferences_path = temp_path / "preferences.yaml"
 
@@ -206,9 +232,89 @@ class ClashSubscriptionToolTests(unittest.TestCase):
                 ],
             )
 
+    def test_run_merges_preference_proxies_and_overrides_matching_names(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir).resolve()
+            settings_path = temp_path / "settings.yaml"
+            preferences_path = temp_path / "preferences.yaml"
+
+            settings_path.write_text(
+                "\n".join(
+                    [
+                        "subscription_url: https://example.com/subscription",
+                        "preferences_file: ./preferences.yaml",
+                        "output_dir: ./out",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            preferences_path.write_text(
+                "\n".join(
+                    [
+                        "proxies:",
+                        "  - name: node-b",
+                        "    type: socks5",
+                        "    server: 8.8.8.8",
+                        "    port: 1080",
+                        "  - name: custom-node",
+                        "    type: http",
+                        "    server: 9.9.9.9",
+                        "    port: 8080",
+                        "rule-providers:",
+                        "  direct:",
+                        "    type: file",
+                        "    behavior: classical",
+                        "    path: ./ruleset/direct.yaml",
+                        "rules:",
+                        "  - MATCH,DIRECT",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            session = FakeSession(
+                FakeResponse(
+                    "\n".join(
+                        [
+                            "proxies:",
+                            "  - name: node-a",
+                            "    type: ss",
+                            "    server: 1.1.1.1",
+                            "    port: 443",
+                            "  - name: node-b",
+                            "    type: ss",
+                            "    server: 2.2.2.2",
+                            "    port: 8443",
+                            "proxy-groups:",
+                            "  - name: Auto",
+                            "    type: url-test",
+                            "    proxies: [node-a, node-b]",
+                        ]
+                    )
+                )
+            )
+
+            result = run(settings_path, session=session, now=datetime(2026, 3, 12, 1, 2, 3))
+
+            merged = yaml.safe_load(result.latest_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [proxy["name"] for proxy in merged["proxies"]],
+                ["node-a", "node-b", "custom-node"],
+            )
+            self.assertEqual(merged["proxies"][1]["type"], "socks5")
+            self.assertEqual(merged["proxies"][1]["server"], "8.8.8.8")
+            self.assertEqual(
+                merged["proxy-groups"][0],
+                {
+                    "name": "PROXY",
+                    "type": "select",
+                    "proxies": ["Auto", "node-b", "custom-node"],
+                },
+            )
+
     def test_preferences_validation_requires_non_empty_sections(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
+            temp_path = Path(temp_dir).resolve()
             settings_path = temp_path / "settings.yaml"
             preferences_path = temp_path / "preferences.yaml"
 
@@ -244,7 +350,7 @@ class ClashSubscriptionToolTests(unittest.TestCase):
 
     def test_subscription_validation_rejects_non_mapping_yaml(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
+            temp_path = Path(temp_dir).resolve()
             settings_path = temp_path / "settings.yaml"
             preferences_path = temp_path / "preferences.yaml"
 
@@ -286,7 +392,7 @@ class ClashSubscriptionToolTests(unittest.TestCase):
     def test_relative_paths_are_resolved_from_settings_file(self) -> None:
         original_cwd = Path.cwd()
         with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as other_dir:
-            temp_path = Path(temp_dir)
+            temp_path = Path(temp_dir).resolve()
             settings_dir = temp_path / "config"
             settings_dir.mkdir()
             settings_path = settings_dir / "settings.yaml"
