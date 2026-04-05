@@ -76,9 +76,3 @@ rules:
 ## Acknowledgements
 
 - The sample rule providers in `preferences.example.yaml` are based on [Loyalsoldier/clash-rules](https://github.com/Loyalsoldier/clash-rules).
-
-## GitHub publishing
-
-- Commit `settings.example.yaml` and `preferences.example.yaml`, not your local `settings.yaml`.
-- Do not commit the generated `output/` directory because it can contain subscription secrets and node credentials.
-- The included `.gitignore` already excludes `settings.yaml`, `preferences.yaml`, `output/`, and Python cache files.
