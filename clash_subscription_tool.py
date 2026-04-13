@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 import requests
 import yaml
@@ -17,6 +18,7 @@ import yaml
 USER_AGENT = "clash-subscription-tool/1.0"
 PRIMARY_PROXY_GROUP_NAME = "PROXY"
 DEFAULT_CONFIG_PATH = "settings.yaml"
+DEFAULT_VLESS_MIXED_PORT = 7890
 
 
 class ToolError(Exception):
@@ -25,7 +27,8 @@ class ToolError(Exception):
 
 @dataclass(frozen=True)
 class ToolConfig:
-    subscription_url: str
+    subscription_url: str | None
+    vless_links: list[str]
     preferences_file: Path
     output_dir: Path
     latest_filename: str
@@ -51,8 +54,8 @@ class RunResult:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Download a Clash subscription, optionally merge proxies, "
-            "and replace rule-providers and rules."
+            "Build a Clash or Mihomo config from either a subscription YAML "
+            "or one or more VLESS links."
         )
     )
     parser.add_argument(
@@ -91,13 +94,11 @@ def run(
     resolved_config_path = config_path.expanduser().resolve()
     config = load_tool_config(resolved_config_path)
     preferences = load_preferences(config.preferences_file)
-    subscription_text = download_subscription(
-        config.subscription_url,
-        timeout=config.request_timeout_sec,
+    merged_config = build_output_config(
+        config,
+        preferences,
         session=session,
     )
-    subscription_config = parse_subscription_config(subscription_text)
-    merged_config = merge_preferences(subscription_config, preferences)
     history_path, latest_path = write_outputs(
         merged_config,
         output_dir=config.output_dir,
@@ -118,9 +119,22 @@ def load_tool_config(config_path: Path) -> ToolConfig:
     if not isinstance(data, Mapping):
         raise ToolError(f"Settings file must contain a YAML mapping: {config_path}")
 
-    subscription_url = require_non_empty_string(
-        data.get("subscription_url"), "settings.subscription_url"
+    subscription_url = load_optional_non_empty_string(
+        data.get("subscription_url"),
+        "settings.subscription_url",
     )
+    vless_links = load_vless_links(data.get("vless_links"))
+    if subscription_url and vless_links:
+        raise ToolError(
+            "Choose exactly one input source: settings.subscription_url or "
+            "settings.vless_links"
+        )
+    if not subscription_url and not vless_links:
+        raise ToolError(
+            "Settings must define exactly one input source: "
+            "settings.subscription_url or settings.vless_links"
+        )
+
     preferences_file_value = require_non_empty_string(
         data.get("preferences_file"), "settings.preferences_file"
     )
@@ -160,6 +174,7 @@ def load_tool_config(config_path: Path) -> ToolConfig:
 
     return ToolConfig(
         subscription_url=subscription_url,
+        vless_links=vless_links,
         preferences_file=preferences_file,
         output_dir=output_dir,
         latest_filename=latest_filename,
@@ -262,6 +277,25 @@ def download_subscription(
     return response.text
 
 
+def build_output_config(
+    config: ToolConfig,
+    preferences: Preferences,
+    *,
+    session: requests.Session | Any | None = None,
+) -> dict[str, Any]:
+    if config.subscription_url:
+        subscription_text = download_subscription(
+            config.subscription_url,
+            timeout=config.request_timeout_sec,
+            session=session,
+        )
+        subscription_config = parse_subscription_config(subscription_text)
+        return merge_preferences(subscription_config, preferences)
+
+    generated_proxies = parse_vless_links(config.vless_links)
+    return build_minimal_config(generated_proxies, preferences)
+
+
 def parse_subscription_config(subscription_text: str) -> dict[str, Any]:
     try:
         data = yaml.safe_load(subscription_text)
@@ -288,6 +322,24 @@ def merge_preferences(
         extra_proxy_names=[proxy["name"] for proxy in preferences.proxies],
     )
     return merged
+
+
+def build_minimal_config(
+    generated_proxies: list[dict[str, Any]],
+    preferences: Preferences,
+) -> dict[str, Any]:
+    merged_proxies = merge_proxies(generated_proxies, preferences.proxies)
+    proxy_names = collect_proxy_names(merged_proxies or [])
+    return {
+        "mixed-port": DEFAULT_VLESS_MIXED_PORT,
+        "allow-lan": False,
+        "mode": "rule",
+        "log-level": "info",
+        "proxies": merged_proxies or [],
+        "proxy-groups": build_minimal_proxy_groups(proxy_names),
+        "rule-providers": copy.deepcopy(preferences.rule_providers),
+        "rules": list(preferences.rules),
+    }
 
 
 def merge_proxies(
@@ -367,6 +419,16 @@ def build_proxy_groups(
     return [primary_group, *remaining_groups]
 
 
+def build_minimal_proxy_groups(proxy_names: list[str]) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": PRIMARY_PROXY_GROUP_NAME,
+            "type": "select",
+            "proxies": list(proxy_names),
+        },
+    ]
+
+
 def write_outputs(
     merged_config: dict[str, Any],
     *,
@@ -418,6 +480,228 @@ def require_non_empty_string(value: Any, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ToolError(f"{field_name} must be a non-empty string")
     return value.strip()
+
+
+def load_optional_non_empty_string(value: Any, field_name: str) -> str | None:
+    if value is None:
+        return None
+    return require_non_empty_string(value, field_name)
+
+
+def load_vless_links(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or not value:
+        raise ToolError("settings.vless_links must be a non-empty list")
+
+    links: list[str] = []
+    for index, item in enumerate(value, start=1):
+        if not isinstance(item, str) or not item.strip():
+            raise ToolError(
+                f"settings.vless_links[{index}] must be a non-empty string"
+            )
+        links.append(item.strip())
+    return links
+
+
+def parse_vless_links(vless_links: list[str]) -> list[dict[str, Any]]:
+    proxies: list[dict[str, Any]] = []
+    used_names: set[str] = set()
+    for index, link in enumerate(vless_links, start=1):
+        proxy = parse_vless_link(link, index=index)
+        proxy["name"] = make_unique_name(proxy["name"], used_names)
+        used_names.add(proxy["name"])
+        proxies.append(proxy)
+    return proxies
+
+
+def parse_vless_link(link: str, *, index: int) -> dict[str, Any]:
+    parsed = urlsplit(link)
+    if parsed.scheme.lower() != "vless":
+        raise ToolError(f"VLESS link #{index} must start with vless://")
+    if not parsed.username:
+        raise ToolError(f"VLESS link #{index} is missing the UUID")
+    if not parsed.hostname:
+        raise ToolError(f"VLESS link #{index} is missing the server host")
+
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ToolError(f"VLESS link #{index} has an invalid server port") from exc
+    if port is None:
+        raise ToolError(f"VLESS link #{index} is missing the server port")
+
+    params = {
+        key: value
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+    }
+    encryption = params.get("encryption", "none")
+    if encryption != "none":
+        raise ToolError(
+            f"VLESS link #{index} has unsupported encryption={encryption!r}; "
+            "expected 'none'"
+        )
+
+    network = params.get("type", "tcp").strip().lower() or "tcp"
+    if network not in {"tcp", "ws"}:
+        raise ToolError(
+            f"VLESS link #{index} has unsupported transport type={network!r}; "
+            "supported: tcp, ws"
+        )
+
+    proxy_name = unquote(parsed.fragment).strip() or f"{parsed.hostname}:{port}"
+    proxy: dict[str, Any] = {
+        "name": proxy_name,
+        "type": "vless",
+        "server": parsed.hostname,
+        "port": port,
+        "uuid": unquote(parsed.username),
+        "network": network,
+        "udp": True,
+    }
+
+    flow = params.get("flow", "").strip()
+    if flow:
+        proxy["flow"] = flow
+
+    tls_fields = build_tls_fields(params, index=index, network=network)
+    proxy.update(tls_fields)
+
+    if network == "tcp":
+        header_type = params.get("headerType", "").strip().lower()
+        if header_type not in {"", "none"}:
+            raise ToolError(
+                f"VLESS link #{index} has unsupported headerType={header_type!r} "
+                "for tcp transport"
+            )
+        if params.get("host") or params.get("path"):
+            raise ToolError(
+                f"VLESS link #{index} includes ws-only parameters for tcp transport"
+            )
+    else:
+        proxy["ws-opts"] = build_ws_opts(params)
+
+    unsupported_transport_params = {
+        "serviceName": "grpc serviceName",
+        "mode": "grpc mode",
+        "authority": "grpc authority",
+    }
+    for key, label in unsupported_transport_params.items():
+        value = params.get(key, "").strip()
+        if value:
+            raise ToolError(
+                f"VLESS link #{index} uses unsupported {label}; only tcp and ws "
+                "transports are supported"
+            )
+
+    return proxy
+
+
+def build_tls_fields(
+    params: Mapping[str, str],
+    *,
+    index: int,
+    network: str,
+) -> dict[str, Any]:
+    security = params.get("security", "none").strip().lower() or "none"
+    skip_cert_verify = parse_truthy_flag(params.get("allowInsecure", "0"))
+    fields: dict[str, Any] = {}
+
+    if security == "none":
+        return fields
+
+    if security == "tls":
+        fields["tls"] = True
+        fields["skip-cert-verify"] = skip_cert_verify
+        servername = params.get("sni", "").strip()
+        if servername:
+            fields["servername"] = servername
+        alpn_value = params.get("alpn", "").strip()
+        if alpn_value:
+            fields["alpn"] = [item.strip() for item in alpn_value.split(",") if item.strip()]
+        fingerprint = params.get("fp", "").strip()
+        if fingerprint:
+            fields["client-fingerprint"] = fingerprint
+        return fields
+
+    if security == "reality":
+        if network != "tcp":
+            raise ToolError(
+                f"VLESS link #{index} uses security=reality with unsupported "
+                f"transport type={network!r}; supported combination: reality + tcp"
+            )
+        public_key = params.get("pbk", "").strip()
+        if not public_key:
+            raise ToolError(
+                f"VLESS link #{index} is missing pbk for security=reality"
+            )
+        servername = params.get("sni", "").strip()
+        if not servername:
+            raise ToolError(
+                f"VLESS link #{index} is missing sni for security=reality"
+            )
+
+        fields["tls"] = True
+        fields["skip-cert-verify"] = skip_cert_verify
+        fields["servername"] = servername
+        fingerprint = params.get("fp", "").strip()
+        if fingerprint:
+            fields["client-fingerprint"] = fingerprint
+
+        reality_opts: dict[str, Any] = {
+            "public-key": public_key,
+        }
+        short_id = params.get("sid", "").strip()
+        if short_id:
+            reality_opts["short-id"] = short_id
+        spider_x = params.get("spx", "").strip()
+        if spider_x:
+            reality_opts["spider-x"] = spider_x
+        fields["reality-opts"] = reality_opts
+        return fields
+
+    raise ToolError(
+        f"VLESS link #{index} has unsupported security={security!r}; "
+        "supported: none, tls, reality"
+    )
+
+
+def build_ws_opts(params: Mapping[str, str]) -> dict[str, Any]:
+    ws_opts: dict[str, Any] = {
+        "path": params.get("path", "").strip() or "/",
+    }
+    host = params.get("host", "").strip()
+    if host:
+        ws_opts["headers"] = {"Host": host}
+    return ws_opts
+
+
+def parse_truthy_flag(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def make_unique_name(name: str, used_names: set[str]) -> str:
+    if name not in used_names:
+        return name
+
+    suffix = 2
+    while True:
+        candidate = f"{name} ({suffix})"
+        if candidate not in used_names:
+            return candidate
+        suffix += 1
+
+
+def collect_proxy_names(proxies: list[Any]) -> list[str]:
+    names: list[str] = []
+    for proxy in proxies:
+        if not isinstance(proxy, Mapping):
+            continue
+        proxy_name = proxy.get("name")
+        if not isinstance(proxy_name, str) or not proxy_name.strip():
+            continue
+        names.append(proxy_name)
+    return names
 
 
 if __name__ == "__main__":

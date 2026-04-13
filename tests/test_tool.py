@@ -66,6 +66,210 @@ class ClashSubscriptionToolTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             run_mock.assert_called_once_with(Path("settings.yaml"))
 
+    def test_vless_links_mode_generates_reality_config_without_network_fetch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir).resolve()
+            settings_path = temp_path / "settings.yaml"
+            preferences_path = temp_path / "preferences.yaml"
+            output_dir = temp_path / "out"
+
+            settings_path.write_text(
+                "\n".join(
+                    [
+                        "vless_links:",
+                        "  - >-",
+                        "    vless://123e4567-e89b-12d3-a456-426614174000@reality.example.com:443?encryption=none&security=reality&type=tcp&sni=www.cloudflare.com&fp=chrome&pbk=publicKey123&sid=abcd1234&spx=%2Fscan&flow=xtls-rprx-vision#Reality%20Node",
+                        "preferences_file: ./preferences.yaml",
+                        "output_dir: ./out",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            preferences_path.write_text(
+                "\n".join(
+                    [
+                        "proxies:",
+                        "  - name: manual-node",
+                        "    type: socks5",
+                        "    server: 127.0.0.1",
+                        "    port: 1080",
+                        "rule-providers:",
+                        "  proxy:",
+                        "    type: file",
+                        "    behavior: classical",
+                        "    path: ./ruleset/proxy.yaml",
+                        "rules:",
+                        "  - RULE-SET,proxy,PROXY",
+                        "  - MATCH,DIRECT",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            session = FakeSession(FakeResponse("unused"))
+            result = run(settings_path, session=session, now=datetime(2026, 3, 12, 9, 8, 7))
+
+            merged = yaml.safe_load(result.latest_path.read_text(encoding="utf-8"))
+            self.assertEqual(result.history_path, output_dir / "config-20260312-090807.yaml")
+            self.assertEqual(merged["mixed-port"], 7890)
+            self.assertEqual(merged["mode"], "rule")
+            self.assertEqual(merged["allow-lan"], False)
+            self.assertEqual([proxy["name"] for proxy in merged["proxies"]], ["Reality Node", "manual-node"])
+            self.assertEqual(merged["proxies"][0]["type"], "vless")
+            self.assertEqual(merged["proxies"][0]["network"], "tcp")
+            self.assertEqual(merged["proxies"][0]["flow"], "xtls-rprx-vision")
+            self.assertEqual(merged["proxies"][0]["servername"], "www.cloudflare.com")
+            self.assertEqual(merged["proxies"][0]["client-fingerprint"], "chrome")
+            self.assertEqual(
+                merged["proxies"][0]["reality-opts"],
+                {
+                    "public-key": "publicKey123",
+                    "short-id": "abcd1234",
+                    "spider-x": "/scan",
+                },
+            )
+            self.assertEqual(
+                merged["proxy-groups"],
+                [
+                    {
+                        "name": "PROXY",
+                        "type": "select",
+                        "proxies": ["Reality Node", "manual-node"],
+                    },
+                ],
+            )
+            self.assertEqual(session.calls, [])
+
+    def test_vless_links_mode_generates_ws_tls_proxy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir).resolve()
+            settings_path = temp_path / "settings.yaml"
+            preferences_path = temp_path / "preferences.yaml"
+
+            settings_path.write_text(
+                "\n".join(
+                    [
+                        "vless_links:",
+                        "  - >-",
+                        "    vless://123e4567-e89b-12d3-a456-426614174001@ws.example.com:8443?encryption=none&security=tls&type=ws&sni=cdn.example.com&host=cdn.example.com&path=%2Fwebsocket&fp=firefox&alpn=h2%2Chttp%2F1.1&allowInsecure=1#WS%20Node",
+                        "preferences_file: ./preferences.yaml",
+                        "output_dir: ./out",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            preferences_path.write_text(
+                "\n".join(
+                    [
+                        "rule-providers:",
+                        "  proxy:",
+                        "    type: file",
+                        "    behavior: classical",
+                        "    path: ./ruleset/proxy.yaml",
+                        "rules:",
+                        "  - RULE-SET,proxy,PROXY",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            result = run(settings_path, now=datetime(2026, 3, 12, 1, 2, 3))
+
+            merged = yaml.safe_load(result.latest_path.read_text(encoding="utf-8"))
+            proxy = merged["proxies"][0]
+            self.assertEqual(proxy["name"], "WS Node")
+            self.assertEqual(proxy["network"], "ws")
+            self.assertEqual(proxy["tls"], True)
+            self.assertEqual(proxy["skip-cert-verify"], True)
+            self.assertEqual(proxy["servername"], "cdn.example.com")
+            self.assertEqual(proxy["client-fingerprint"], "firefox")
+            self.assertEqual(proxy["alpn"], ["h2", "http/1.1"])
+            self.assertEqual(
+                proxy["ws-opts"],
+                {
+                    "path": "/websocket",
+                    "headers": {"Host": "cdn.example.com"},
+                },
+            )
+
+    def test_settings_validation_requires_exactly_one_input_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir).resolve()
+            settings_path = temp_path / "settings.yaml"
+            preferences_path = temp_path / "preferences.yaml"
+
+            settings_path.write_text(
+                "\n".join(
+                    [
+                        "subscription_url: https://example.com/subscription",
+                        "vless_links:",
+                        "  - vless://123e4567-e89b-12d3-a456-426614174002@example.com:443?encryption=none#node",
+                        "preferences_file: ./preferences.yaml",
+                        "output_dir: ./out",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            preferences_path.write_text(
+                "\n".join(
+                    [
+                        "rule-providers:",
+                        "  proxy:",
+                        "    type: file",
+                        "    behavior: classical",
+                        "    path: ./ruleset/proxy.yaml",
+                        "rules:",
+                        "  - MATCH,DIRECT",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ToolError,
+                "Choose exactly one input source",
+            ):
+                run(settings_path, now=datetime(2026, 3, 12, 1, 2, 3))
+
+    def test_vless_links_reject_unsupported_transport(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir).resolve()
+            settings_path = temp_path / "settings.yaml"
+            preferences_path = temp_path / "preferences.yaml"
+
+            settings_path.write_text(
+                "\n".join(
+                    [
+                        "vless_links:",
+                        "  - >-",
+                        "    vless://123e4567-e89b-12d3-a456-426614174003@grpc.example.com:443?encryption=none&security=tls&type=grpc&serviceName=my-service#grpc-node",
+                        "preferences_file: ./preferences.yaml",
+                        "output_dir: ./out",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            preferences_path.write_text(
+                "\n".join(
+                    [
+                        "rule-providers:",
+                        "  proxy:",
+                        "    type: file",
+                        "    behavior: classical",
+                        "    path: ./ruleset/proxy.yaml",
+                        "rules:",
+                        "  - MATCH,DIRECT",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ToolError,
+                "unsupported transport type='grpc'",
+            ):
+                run(settings_path, now=datetime(2026, 3, 12, 1, 2, 3))
+
     def test_run_replaces_rules_rule_providers_and_prepends_proxy_group(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir).resolve()

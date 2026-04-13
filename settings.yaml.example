@@ -1,4 +1,8 @@
+# Choose exactly one input source.
 subscription_url: https://example.com/api/v1/client/subscribe?token=YOUR_TOKEN&flag=clash
+# vless_links:
+#   - vless://123e4567-e89b-12d3-a456-426614174000@example.com:443?encryption=none&security=reality&type=tcp&sni=www.cloudflare.com&fp=chrome&pbk=YOUR_PUBLIC_KEY&sid=abcd1234#example-node
+
 preferences_file: ./preferences.yaml
 output_dir: ./output
 latest_filename: latest.yaml
